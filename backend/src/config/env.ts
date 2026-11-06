@@ -36,7 +36,19 @@ const envSchema = z.object({
   JWT_EXPIRES_IN: z.string().default('24h'),
 
   // Mật khẩu quản trị viên mặc định khi nạp dữ liệu seed
-  SEED_ADMIN_PASSWORD: z.string().default('Admin@123456')
+  SEED_ADMIN_PASSWORD: z.string().default('Admin@123456'),
+
+  // Cấu hình nghiệp vụ Phase 3 (Parking Session, Billing & Grace Period)
+  DEFAULT_EXIT_GRACE_PERIOD_MINUTES: z
+    .string()
+    .default('10')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().nonnegative()),
+  DEFAULT_ENTRY_TIMEOUT_SECONDS: z
+    .string()
+    .default('60')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive())
 });
 
 const parseEnv = () => {

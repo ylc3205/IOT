@@ -121,6 +121,11 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  manualEntrySessions     ParkingSession[]        @relation("ManualEntrySessions")
+  manualExitSessions      ParkingSession[]        @relation("ManualExitSessions")
+  paymentReceivedSessions ParkingSession[]        @relation("PaymentReceivedSessions")
+  sessionPayments         ParkingSessionPayment[]
+
   @@map("users")
 }
 
@@ -184,22 +189,90 @@ model ParkingSession {
   entryTime     DateTime             @default(now()) // Thời điểm xe qua cổng vào
   exitTime      DateTime?            // Thời điểm xe qua cổng ra (null khi đang gửi)
   status        ParkingSessionStatus @default(ACTIVE)
-  totalFee      Decimal              @default(0) @db.Decimal(10, 2) // Phí gửi xe (>= 0)
-  paymentStatus PaymentStatus        @default(UNPAID)
+
+  // 1. Snapshot biểu giá tại thời điểm vào bãi
+  pricingRuleId String?
+  pricingType   PricingType?
+  pricingRate   Decimal?             @db.Decimal(10, 2)
+
+  // 2. Chốt cước và thời lượng tính tiền
+  billingCutoffTime DateTime?
+  durationMinutes   Int?
+  billableHours     Int?
+
+  // 3. Quản lý tài chính lũy kế (Không thu trùng tiền)
+  totalFee          Decimal       @default(0) @db.Decimal(10, 2) // Phí gửi xe (>= 0)
+  paidAmount        Decimal       @default(0) @db.Decimal(10, 2) // Tổng tiền đã thực thu
+  paymentStatus     PaymentStatus @default(UNPAID)               // UNPAID, PAID, EXEMPT
+  paymentTime       DateTime?     // Thời điểm thanh toán gần nhất
+  paymentOperatorId String?       // Thu ngân xác nhận gần nhất
+
+  // 4. Vết kiểm toán vào thủ công
+  isManualEntry         Boolean @default(false)
+  manualEntryReason     String?
+  manualEntryOperatorId String?
+
+  // 5. Vết kiểm toán ra thủ công
+  isManualExit         Boolean @default(false)
+  manualExitReason     String?
+  manualExitOperatorId String?
+
+  // 6. Thông tin hủy phiên
+  cancelledAt  DateTime?
+  cancelReason String?
+
   createdAt     DateTime             @default(now())
   updatedAt     DateTime             @updatedAt
 
   // Ràng buộc bảo toàn dữ liệu lịch sử: Không cho phép cascade delete
-  parkingLot ParkingLot @relation(fields: [parkingLotId], references: [id], onDelete: Restrict)
-  vehicle    Vehicle    @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
-  rfidCard   RFIDCard   @relation(fields: [rfidCardId], references: [id], onDelete: Restrict)
+  parkingLot            ParkingLot              @relation(fields: [parkingLotId], references: [id], onDelete: Restrict)
+  vehicle               Vehicle                 @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  rfidCard              RFIDCard                @relation(fields: [rfidCardId], references: [id], onDelete: Restrict)
+  manualEntryOperator   User?                   @relation("ManualEntrySessions", fields: [manualEntryOperatorId], references: [id], onDelete: SetNull)
+  manualExitOperator    User?                   @relation("ManualExitSessions", fields: [manualExitOperatorId], references: [id], onDelete: SetNull)
+  paymentOperator       User?                   @relation("PaymentReceivedSessions", fields: [paymentOperatorId], references: [id], onDelete: SetNull)
+  payments              ParkingSessionPayment[]
 
   @@index([status])
   @@index([entryTime])
   @@index([parkingLotId, status])
   @@index([vehicleId])
   @@index([rfidCardId])
+  @@index([isManualEntry])
+  @@index([isManualExit])
   @@map("parking_sessions")
+}
+
+/// Lịch sử từng lần thu tiền mặt của phiên gửi xe
+model ParkingSessionPayment {
+  id          String   @id @default(uuid())
+  sessionId   String   @map("session_id")
+  amount      Decimal  @db.Decimal(10, 2) // Số tiền thu trong đợt này
+  paymentTime DateTime @default(now()) @map("payment_time")
+  operatorId  String?  @map("operator_id")
+  paymentType String   @default("CASH")   // Tiền mặt tại quầy
+  note        String?  // Ghi chú (VD: "INITIAL_PAYMENT", "OVERTIME_SURCHARGE")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  session  ParkingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  operator User?          @relation(fields: [operatorId], references: [id], onDelete: SetNull)
+
+  @@index([sessionId])
+  @@map("parking_session_payments")
+}
+
+/// Quản lý khóa chống trùng lặp yêu cầu HTTP đột biến
+model IdempotencyKey {
+  key            String   @id // Client UUIDv4 từ Header Idempotency-Key
+  targetPath     String   @map("target_path")
+  requestHash    String   @map("request_hash") // SHA-256(method + path + userId + body)
+  responseStatus Int?     @map("response_status")
+  responseBody   Json?    @map("response_body")
+  lockedUntil    DateTime @map("locked_until")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("idempotency_keys")
 }
 
 /// Thiết bị biên IoT (ESP32 Gateway / Barrier Node)

@@ -12,6 +12,7 @@ import { parkingSlotRouter } from './modules/parking-slots/parking-slot.router';
 import { vehicleRouter } from './modules/vehicles/vehicle.router';
 import { rfidRouter } from './modules/rfid-cards/rfid.router';
 import { pricingRouter } from './modules/pricing/pricing.router';
+import { parkingSessionRouter } from './modules/parking-sessions/parking-session.router';
 
 /**
  * Khởi tạo ứng dụng Express (Application Bootstrap).
@@ -48,6 +49,7 @@ export function createApp(): Application {
   app.use('/api/vehicles', vehicleRouter);
   app.use('/api/rfid-cards', rfidRouter);
   app.use('/api/pricing-rules', pricingRouter);
+  app.use('/api/parking-sessions', parkingSessionRouter);
 
   // 6. Middleware xử lý 404 Not Found
   app.use(notFoundMiddleware);
