@@ -1,0 +1,288 @@
+// ==============================================================================
+// SMART PARKING IOT - PRISMA SCHEMA (PHASE 2 PARKING SLOT EXTENSION)
+// ==============================================================================
+// Ghi chú kiến trúc:
+// Schema này hiện thực hóa toàn bộ mô hình thực thể quan hệ cho hệ thống bãi đỗ xe:
+// - Quản lý tài khoản CMS (User)
+// - Thông số bãi đỗ xe (ParkingLot)
+// - Vị trí đỗ xe riêng lẻ và liên kết cảm biến IoT (ParkingSlot)
+// - Phương tiện & Thẻ từ RFID (Vehicle, RFIDCard)
+// - Phiên gửi xe & Tính phí (ParkingSession, PricingRule)
+// - Thiết bị biên IoT & Nhật ký sự kiện bất biến (Device, DeviceEvent)
+// ==============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==============================================================================
+// 1. ENUMS (HỆ THỐNG KIỂU DỮ LIỆU ĐỊNH DANH)
+// ==============================================================================
+
+/// Phân loại phương tiện giao thông ra vào bãi
+enum VehicleType {
+  CAR        // Ô tô 4-7 chỗ
+  MOTORBIKE  // Xe máy, xe hai bánh
+}
+
+/// Trạng thái hoạt động của thẻ từ RFID
+enum RfidCardStatus {
+  ACTIVE    // Đang hoạt động bình thường
+  INACTIVE  // Tạm ngừng kích hoạt
+  LOST      // Bị báo mất (chặn quét tại barrier)
+  BLOCKED   // Bị khóa do vi phạm hoặc sự cố an ninh
+}
+
+/// Chu kỳ trạng thái của một phiên gửi xe
+enum ParkingSessionStatus {
+  PENDING_ENTRY // Quẹt thẻ tại cổng vào, đang chờ xe qua barrier
+  ACTIVE        // Xe đã vào bãi an toàn, phiên đỗ đang tính giờ
+  PENDING_EXIT  // Quẹt thẻ tại cổng ra, chờ thanh toán hoặc xác nhận
+  COMPLETED     // Xe đã ra khỏi bãi an toàn, phiên kết thúc
+  CANCELLED     // Phiên bị hủy (ví dụ quẹt thẻ nhưng xe lùi lại không vào)
+}
+
+/// Trạng thái thanh toán phí gửi xe
+enum PaymentStatus {
+  UNPAID // Chưa thanh toán
+  PAID   // Đã thanh toán đầy đủ
+  EXEMPT // Miễn phí (vé nội bộ, xe ưu tiên)
+}
+
+/// Phân loại phần cứng thiết bị biên IoT (ESP32)
+enum DeviceType {
+  GATE_ENTRY  // Node điều khiển cổng vào (RC522 + IR + Servo)
+  GATE_EXIT   // Node điều khiển cổng ra (RC522 + IR + Servo)
+  SENSOR_NODE // Node cảm biến đo lường (dự lưu)
+}
+
+/// Trạng thái kết nối trực tuyến của thiết bị biên
+enum DeviceStatus {
+  ONLINE      // Đang kết nối gửi heartbeat ổn định
+  OFFLINE     // Mất tín hiệu quá thời gian timeout
+  MAINTENANCE // Đang trong chế độ bảo trì, tạm dừng điều khiển
+}
+
+/// Trạng thái xử lý sự kiện bất biến thu nhận qua MQTT
+enum EventProcessingStatus {
+  PENDING   // Mới nhận từ MQTT broker, chờ worker xử lý
+  PROCESSED // Đã phân tích cú pháp và áp dụng logic thành công
+  FAILED    // Xử lý thất bại (lỗi định dạng hoặc vi phạm ràng buộc)
+  IGNORED   // Bản tin bị bỏ qua (trùng lặp hoặc không thuộc phạm vi)
+}
+
+/// Cơ chế tính biểu phí gửi xe
+enum PricingType {
+  PER_VISIT // Tính phí cố định theo lượt
+  PER_HOUR  // Tính phí lũy tiến theo số giờ đỗ
+}
+
+/// Trạng thái cảm biến vật lý tại vị trí đỗ
+enum SensorStatus {
+  EMPTY    // Vị trí đỗ đang trống
+  OCCUPIED // Có phương tiện đang đỗ trên vị trí
+  UNKNOWN  // Chưa xác định được (mất kết nối cảm biến hoặc chưa đồng bộ)
+}
+
+/// Trạng thái vận hành của vị trí đỗ xe
+enum SlotOperationalStatus {
+  AVAILABLE   // Sẵn sàng tiếp nhận xe
+  OCCUPIED    // Đang có xe đỗ
+  MAINTENANCE // Đang bảo trì, tạm khóa vị trí
+}
+
+// ==============================================================================
+// 2. DOMAIN MODELS (CÁC THỰC THỂ CƠ SỞ DỮ LIỆU)
+// ==============================================================================
+
+/// Bảng kiểm tra xác thực hạ tầng từ Pha 0 (bảo toàn tương thích migration)
+model DatabaseVerification {
+  id         String   @id @default(uuid())
+  name       String   @default("smart_parking_phase_0")
+  status     String   @default("INITIALIZED")
+  verifiedAt DateTime @default(now())
+
+  @@map("database_verifications")
+}
+
+/// Tài khoản người dùng vận hành hệ thống CMS
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String?  // Mã băm mật khẩu (dự lưu cho pha Authentication)
+  fullName     String?  // Họ và tên nhân viên vận hành
+  role         String   @default("OPERATOR") // Vai trò quản trị/vận hành
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("users")
+}
+
+/// Thông tin bãi đỗ xe vật lý
+model ParkingLot {
+  id            String   @id @default(uuid())
+  name          String   // Tên bãi đỗ xe (VD: Bãi Đỗ Xe Đại Học - Khu A)
+  location      String?  // Địa chỉ hoặc vị trí cụ thể
+  totalCapacity Int      // Sức chứa tối đa (dùng để tính toán số chỗ trống)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  devices         Device[]
+  pricingRules    PricingRule[]
+  parkingSessions ParkingSession[]
+  parkingSlots    ParkingSlot[]
+
+  @@map("parking_lots")
+}
+
+/// Thông tin phương tiện gửi xe
+model Vehicle {
+  id           String      @id @default(uuid())
+  licensePlate String      @unique // Biển số xe chuẩn hóa viết hoa (VD: 51A-12345)
+  vehicleType  VehicleType @default(CAR)
+  isActive     Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  rfidCards       RFIDCard[]
+  parkingSessions ParkingSession[]
+
+  @@index([licensePlate])
+  @@map("vehicles")
+}
+
+/// Thẻ từ định danh RFID (Mifare RC522 13.56MHz)
+model RFIDCard {
+  id        String         @id @default(uuid())
+  uid       String         @unique // Mã UID phần cứng chuẩn hóa viết hoa (VD: E20000190600)
+  vehicleId String?        // Gán cố định cho phương tiện hoặc để null (thẻ vãng lai/khách)
+  status    RfidCardStatus @default(ACTIVE)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  vehicle         Vehicle?         @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  parkingSessions ParkingSession[]
+
+  @@index([uid])
+  @@index([vehicleId])
+  @@map("rfid_cards")
+}
+
+/// Phiên gửi xe ghi nhận toàn bộ chu kỳ xe vào - ra
+model ParkingSession {
+  id            String               @id @default(uuid())
+  parkingLotId  String
+  vehicleId     String
+  rfidCardId    String
+  entryTime     DateTime             @default(now()) // Thời điểm xe qua cổng vào
+  exitTime      DateTime?            // Thời điểm xe qua cổng ra (null khi đang gửi)
+  status        ParkingSessionStatus @default(ACTIVE)
+  totalFee      Decimal              @default(0) @db.Decimal(10, 2) // Phí gửi xe (>= 0)
+  paymentStatus PaymentStatus        @default(UNPAID)
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  // Ràng buộc bảo toàn dữ liệu lịch sử: Không cho phép cascade delete
+  parkingLot ParkingLot @relation(fields: [parkingLotId], references: [id], onDelete: Restrict)
+  vehicle    Vehicle    @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
+  rfidCard   RFIDCard   @relation(fields: [rfidCardId], references: [id], onDelete: Restrict)
+
+  @@index([status])
+  @@index([entryTime])
+  @@index([parkingLotId, status])
+  @@index([vehicleId])
+  @@index([rfidCardId])
+  @@map("parking_sessions")
+}
+
+/// Thiết bị biên IoT (ESP32 Gateway / Barrier Node)
+model Device {
+  id              String       @id @default(uuid())
+  deviceCode      String       @unique // Mã định danh thiết bị (VD: GATE_IN_01)
+  deviceType      DeviceType
+  parkingLotId    String
+  status          DeviceStatus @default(OFFLINE)
+  lastSeen        DateTime?    // Thời điểm nhận bản tin heartbeat gần nhất
+  ipAddress       String?
+  firmwareVersion String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  parkingLot   ParkingLot    @relation(fields: [parkingLotId], references: [id], onDelete: Restrict)
+  events       DeviceEvent[]
+  managedSlots ParkingSlot[]
+
+  @@index([parkingLotId])
+  @@map("devices")
+}
+
+/// Vị trí đỗ xe riêng lẻ trong bãi đỗ xe và liên kết cảm biến IoT
+model ParkingSlot {
+  id                String                @id @default(uuid())
+  parkingLotId      String
+  slotCode          String                // Mã định danh vị trí đỗ (VD: A-01, B-02)
+  sensorDeviceId    String?               // Thiết bị cảm biến gắn với vị trí (nếu có)
+  sensorChannel     Int?                  // Kênh cảm biến trên board ESP32 (1, 2, ...)
+  sensorStatus      SensorStatus          @default(UNKNOWN)
+  operationalStatus SlotOperationalStatus @default(AVAILABLE)
+  isActive          Boolean               @default(true)
+  lastSensorUpdate  DateTime?             // Thời điểm cập nhật trạng thái cảm biến gần nhất
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  parkingLot   ParkingLot @relation(fields: [parkingLotId], references: [id], onDelete: Restrict)
+  sensorDevice Device?    @relation(fields: [sensorDeviceId], references: [id], onDelete: SetNull)
+
+  @@unique([parkingLotId, slotCode])
+  @@unique([sensorDeviceId, sensorChannel])
+  @@index([parkingLotId, operationalStatus])
+  @@index([sensorStatus])
+  @@map("parking_slots")
+}
+
+/// Bảng nhật ký sự kiện IoT nhận từ MQTT (Hỗ trợ Idempotency và Audit Trail)
+model DeviceEvent {
+  id               String                @id @default(uuid())
+  eventId          String                // Mã sự kiện duy nhất từ thiết bị (UUID hoặc chuỗi thời gian)
+  deviceId         String                // Mã khóa ngoại trỏ tới bảng Device
+  eventType        String                // Loại sự kiện (RFID_SCANNED, GATE_COMMAND, v.v.)
+  payload          Json                  // Dữ liệu bản tin dạng JSON nguyên bản
+  receivedAt       DateTime              @default(now())
+  processedAt      DateTime?
+  processingStatus EventProcessingStatus @default(PENDING)
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  // Khóa duy nhất ngăn chặn xử lý trùng lặp sự kiện MQTT QoS 1 (Khắc phục phát hiện IOT-01)
+  @@unique([deviceId, eventId], name: "deviceId_eventId")
+  @@index([receivedAt])
+  @@index([deviceId, eventType])
+  @@index([processingStatus])
+  @@map("device_events")
+}
+
+/// Cấu hình biểu giá gửi xe linh hoạt
+model PricingRule {
+  id           String      @id @default(uuid())
+  parkingLotId String
+  vehicleType  VehicleType
+  pricingType  PricingType
+  amount       Decimal     @db.Decimal(10, 2) // Giá tiền (>= 0, dùng Decimal tránh sai số dấu phẩy động)
+  isActive     Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  parkingLot ParkingLot @relation(fields: [parkingLotId], references: [id], onDelete: Restrict)
+
+  // Đảm bảo không trùng lặp quy tắc cho cùng loại xe và kiểu tính giá trong một bãi
+  @@unique([parkingLotId, vehicleType, pricingType])
+  @@index([parkingLotId])
+  @@map("pricing_rules")
+}

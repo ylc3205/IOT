@@ -1,0 +1,9 @@
+# ==============================================================================
+# Smart Parking Access Control List (ACL) - Development Configuration
+# ==============================================================================
+# Do not allow anonymous users access to any topic.
+# User smartparking_user has scoped access to the smartparking/# topic namespace.
+
+user smartparking_user
+topic readwrite smartparking/#
+
