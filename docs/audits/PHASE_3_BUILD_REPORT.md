@@ -18,7 +18,7 @@ Pha 3 đã hiện thực hóa trọn vẹn và hoàn chỉnh toàn bộ logic ng
    - Bổ sung thực thể `IdempotencyKey` bảo vệ chống gửi trùng lặp yêu cầu mạng đột biến bằng SHA-256 fingerprint và khóa thời gian thực.
    - Bổ sung 14 trường dữ liệu snapshot biểu giá, chốt cước, thanh toán, vết kiểm toán nhân viên vận hành thủ công và lý do hủy phiên trên `ParkingSession`.
 2. **Động cơ tính phí gửi xe (Billing Calculator Engine)**:
-   - Quy tắc làm tròn lên lũy tiến 15 phút: $\text{durationMinutes} \le 15$ tính 1 giờ đầu; $>15$ phút lẻ tính tròn thêm 1 giờ tiếp theo.
+   - Quy tắc tính cước theo giờ chuẩn (Hourly billing with partial-hour ceil): $\text{billableHours} = \max(1, \lceil \text{durationMinutes} / 60 \rceil)$ — Tối thiểu 1 giờ, bất kỳ thời gian lẻ nào sau đó đều được làm tròn lên 1 giờ tiếp theo.
    - Bảo toàn biểu giá snapshot (`pricingRate`, `pricingType`) độc lập với các thay đổi sau này của bảng biểu giá.
    - Kiểm soát thời gian ân hạn rời bãi (Grace Period, mặc định 10 phút). Nếu xe nán lại bãi quá ân hạn, hệ thống tự động phát hiện phụ thu quá giờ và không thu trùng khoản tiền đã trả.
 3. **Thuật toán tiếp nhận xe bảo thủ (Conservative Admission Guard)**:

@@ -416,4 +416,205 @@ describe('ParkingSession Lifecycle & Multi-Payment Tests', () => {
     expect(payments[0].amount.toString()).toBe('15000');
     expect(payments[1].amount.toString()).toBe('15000');
   });
+
+  it('LIF-11: F01 — Entry Timeout: Chưa quá 60s không bị hủy, quá 60s bị hủy, đã ACTIVE không bị hủy', async () => {
+    const v = await prisma.vehicle.create({
+      data: {
+        licensePlate: `51A-TIM-${Date.now().toString().slice(-4)}`,
+        vehicleType: VehicleType.CAR,
+        isActive: true
+      }
+    });
+
+    const cardUid = `TIM${Date.now().toString().slice(-6)}`;
+    const card = await prisma.rFIDCard.create({
+      data: { uid: cardUid, vehicleId: v.id, status: RfidCardStatus.ACTIVE }
+    });
+
+    const pendingSession = await parkingSessionService.requestEntry({
+      parkingLotId: testLotId,
+      cardUid
+    });
+    expect(pendingSession.status).toBe(ParkingSessionStatus.PENDING_ENTRY);
+
+    // 1. Kiểm tra khi chưa quá 60 giây -> cancelExpiredEntrySession phải trả về null
+    const skippedResult = await parkingSessionService.cancelExpiredEntrySession(pendingSession.id);
+    expect(skippedResult).toBeNull();
+
+    const stillPending = await parkingSessionService.getSessionById(pendingSession.id);
+    expect(stillPending.status).toBe(ParkingSessionStatus.PENDING_ENTRY);
+
+    // 2. Giả lập phiên đã quá hạn 60 giây (lùi entryTime về 65 giây trước)
+    await prisma.parkingSession.update({
+      where: { id: pendingSession.id },
+      data: { entryTime: new Date(Date.now() - 65 * 1000) }
+    });
+
+    const cancelledResult = await parkingSessionService.cancelExpiredEntrySession(pendingSession.id);
+    expect(cancelledResult).not.toBeNull();
+    expect(cancelledResult?.status).toBe(ParkingSessionStatus.CANCELLED);
+    expect(cancelledResult?.cancelReason).toBe('ENTRY_TIMEOUT_EXPIRED');
+
+    // 3. Khi phiên đã ACTIVE -> cancelExpiredEntrySession tuyệt đối không được hủy
+    const activeSession = await parkingSessionService.manualEntry(testUserId, {
+      parkingLotId: testLotId,
+      licensePlate: `51A-ACT-${Date.now().toString().slice(-4)}`,
+      vehicleType: VehicleType.CAR,
+      manualEntryReason: 'Test không hủy ACTIVE'
+    });
+    const activeCancelAttempt = await parkingSessionService.cancelExpiredEntrySession(activeSession.id);
+    expect(activeCancelAttempt).toBeNull();
+
+    // Dọn dẹp
+    await parkingSessionService.calculateFee(activeSession.id, true);
+    await parkingSessionService.confirmPayment(testUserId, activeSession.id, { amount: 15000 });
+    await parkingSessionService.manualExit(testUserId, activeSession.id, {
+      manualExitReason: 'Dọn dẹp',
+      vehicleDepartedConfirmed: true
+    });
+    await prisma.parkingSession.delete({ where: { id: pendingSession.id } });
+    await prisma.rFIDCard.delete({ where: { id: card.id } });
+    await prisma.vehicle.delete({ where: { id: v.id } });
+  });
+
+  it('LIF-12: F02 — Vào bãi thủ công không truyền thẻ RFID: Lưu rfidCardId = null, không tạo thẻ giả lập', async () => {
+    const plate = `51A-NORFID-${Date.now().toString().slice(-4)}`;
+    const session = await parkingSessionService.manualEntry(testUserId, {
+      parkingLotId: testLotId,
+      licensePlate: plate,
+      vehicleType: VehicleType.CAR,
+      manualEntryReason: 'Khách vãng lai không quét thẻ RFID'
+    });
+
+    expect(session.status).toBe(ParkingSessionStatus.ACTIVE);
+    expect(session.rfidCardId).toBeNull();
+
+    // Kiểm tra trong CSDL: rfidCardId là null
+    const dbSession = await prisma.parkingSession.findUnique({
+      where: { id: session.id },
+      include: { rfidCard: true }
+    });
+    expect(dbSession?.rfidCardId).toBeNull();
+    expect(dbSession?.rfidCard).toBeNull();
+
+    // Dọn dẹp
+    await parkingSessionService.calculateFee(session.id, true);
+    await parkingSessionService.confirmPayment(testUserId, session.id, { amount: 15000 });
+    await parkingSessionService.manualExit(testUserId, session.id, {
+      manualExitReason: 'Dọn dẹp',
+      vehicleDepartedConfirmed: true
+    });
+  });
+
+  it('LIF-13: F03 — Tính nguyên tử khi bị từ chối tiếp nhận (Hết chỗ): Xe mới không bị lưu lại CSDL', async () => {
+    // 1. Tạo bãi xe dung lượng 1 chỗ đỗ duy nhất
+    const miniLot = await prisma.parkingLot.create({
+      data: {
+        name: `Bãi Mini 1 chỗ ${Date.now()}`,
+        totalCapacity: 1,
+        isActive: true
+      }
+    });
+
+    await prisma.pricingRule.create({
+      data: {
+        parkingLotId: miniLot.id,
+        vehicleType: VehicleType.CAR,
+        pricingType: PricingType.PER_HOUR,
+        amount: new Prisma.Decimal('15000.00'),
+        isActive: true
+      }
+    });
+
+    // Chiếm chỗ duy nhất
+    const occSession = await parkingSessionService.manualEntry(testUserId, {
+      parkingLotId: miniLot.id,
+      licensePlate: `51A-MINI1-${Date.now().toString().slice(-4)}`,
+      vehicleType: VehicleType.CAR,
+      manualEntryReason: 'Chiếm chỗ duy nhất'
+    });
+
+    // 2. Cố gắng tiếp nhận xe mới khi bãi đã đầy -> Bị ném lỗi PARKING_LOT_FULL
+    const newPlate = `51A-REJECT-${Date.now().toString().slice(-4)}`;
+    await expect(
+      parkingSessionService.manualEntry(testUserId, {
+        parkingLotId: miniLot.id,
+        licensePlate: newPlate,
+        vehicleType: VehicleType.CAR,
+        manualEntryReason: 'Cố vào khi bãi đầy'
+      })
+    ).rejects.toThrow(/hết chỗ trống khả dụng/);
+
+    // 3. Kiểm tra tính nguyên tử (Atomicity): Xe newPlate tuyệt đối KHÔNG tồn tại trong bảng vehicles
+    const orphanedVehicle = await prisma.vehicle.findUnique({
+      where: { licensePlate: newPlate }
+    });
+    expect(orphanedVehicle).toBeNull();
+
+    // Dọn dẹp
+    await parkingSessionService.calculateFee(occSession.id, true);
+    await parkingSessionService.confirmPayment(testUserId, occSession.id, { amount: 15000 });
+    await parkingSessionService.manualExit(testUserId, occSession.id, {
+      manualExitReason: 'Dọn dẹp',
+      vehicleDepartedConfirmed: true
+    });
+    await prisma.parkingSessionPayment.deleteMany({ where: { session: { parkingLotId: miniLot.id } } });
+    await prisma.parkingSession.deleteMany({ where: { parkingLotId: miniLot.id } });
+    await prisma.pricingRule.deleteMany({ where: { parkingLotId: miniLot.id } });
+    await prisma.parkingLot.delete({ where: { id: miniLot.id } });
+  });
+
+  it('LIF-14: F06 — Ra bãi trong thời gian ân hạn rời bãi (5 phút sau thanh toán): Không phát sinh thêm cước', async () => {
+    const session = await parkingSessionService.manualEntry(testUserId, {
+      parkingLotId: testLotId,
+      licensePlate: `51A-GRACE-${Date.now().toString().slice(-4)}`,
+      vehicleType: VehicleType.CAR,
+      manualEntryReason: 'Test ân hạn rời bãi'
+    });
+
+    // Chốt cước & thanh toán đợt 1
+    await parkingSessionService.calculateFee(session.id, true);
+    await parkingSessionService.confirmPayment(testUserId, session.id, { amount: 15000 });
+
+    // Giả lập đã thanh toán 5 phút trước (vẫn nằm trong ân hạn 10 phút)
+    await prisma.parkingSession.update({
+      where: { id: session.id },
+      data: {
+        paymentTime: new Date(Date.now() - 5 * 60 * 1000)
+      }
+    });
+
+    // Xuất bãi thành công ngay lập tức không bị báo phụ thu
+    const completed = await parkingSessionService.manualExit(testUserId, session.id, {
+      manualExitReason: 'Ra bãi trong ân hạn',
+      vehicleDepartedConfirmed: true
+    });
+
+    expect(completed.status).toBe(ParkingSessionStatus.COMPLETED);
+    expect(completed.totalFee.toString()).toBe('15000');
+    expect(completed.paidAmount.toString()).toBe('15000');
+  });
+
+  it('LIF-15: F05 — Bảo toàn lịch sử tài chính: onDelete Restrict ngăn chặn xóa cứng phiên đã thu tiền', async () => {
+    const session = await parkingSessionService.manualEntry(testUserId, {
+      parkingLotId: testLotId,
+      licensePlate: `51A-HIST-${Date.now().toString().slice(-4)}`,
+      vehicleType: VehicleType.CAR,
+      manualEntryReason: 'Test bảo toàn lịch sử thanh toán'
+    });
+
+    await parkingSessionService.calculateFee(session.id, true);
+    await parkingSessionService.confirmPayment(testUserId, session.id, { amount: 15000 });
+
+    // Cố tình xóa phiên đỗ có bản ghi thanh toán -> Bị chặn bởi foreign key constraint (onDelete: Restrict)
+    await expect(
+      prisma.parkingSession.delete({ where: { id: session.id } })
+    ).rejects.toThrow();
+
+    // Dọn dẹp an toàn
+    await parkingSessionService.manualExit(testUserId, session.id, {
+      manualExitReason: 'Dọn dẹp',
+      vehicleDepartedConfirmed: true
+    });
+  });
 });

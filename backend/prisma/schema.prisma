@@ -185,7 +185,7 @@ model ParkingSession {
   id            String               @id @default(uuid())
   parkingLotId  String
   vehicleId     String
-  rfidCardId    String
+  rfidCardId    String?              // Nullable: Hỗ trợ vào thủ công khi không quét thẻ RFID (F02)
   entryTime     DateTime             @default(now()) // Thời điểm xe qua cổng vào
   exitTime      DateTime?            // Thời điểm xe qua cổng ra (null khi đang gửi)
   status        ParkingSessionStatus @default(ACTIVE)
@@ -227,7 +227,7 @@ model ParkingSession {
   // Ràng buộc bảo toàn dữ liệu lịch sử: Không cho phép cascade delete
   parkingLot            ParkingLot              @relation(fields: [parkingLotId], references: [id], onDelete: Restrict)
   vehicle               Vehicle                 @relation(fields: [vehicleId], references: [id], onDelete: Restrict)
-  rfidCard              RFIDCard                @relation(fields: [rfidCardId], references: [id], onDelete: Restrict)
+  rfidCard              RFIDCard?               @relation(fields: [rfidCardId], references: [id], onDelete: SetNull)
   manualEntryOperator   User?                   @relation("ManualEntrySessions", fields: [manualEntryOperatorId], references: [id], onDelete: SetNull)
   manualExitOperator    User?                   @relation("ManualExitSessions", fields: [manualExitOperatorId], references: [id], onDelete: SetNull)
   paymentOperator       User?                   @relation("PaymentReceivedSessions", fields: [paymentOperatorId], references: [id], onDelete: SetNull)
@@ -254,7 +254,7 @@ model ParkingSessionPayment {
   note        String?  // Ghi chú (VD: "INITIAL_PAYMENT", "OVERTIME_SURCHARGE")
   createdAt   DateTime @default(now()) @map("created_at")
 
-  session  ParkingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  session  ParkingSession @relation(fields: [sessionId], references: [id], onDelete: Restrict)
   operator User?          @relation(fields: [operatorId], references: [id], onDelete: SetNull)
 
   @@index([sessionId])

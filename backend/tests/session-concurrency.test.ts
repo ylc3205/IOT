@@ -205,7 +205,7 @@ describe('PostgreSQL Concurrency & Race Condition Tests (Real Database)', () => 
       .catch((err) => ({ action: 'PASSAGE_FAILED', error: err }));
 
     const p2 = parkingSessionService
-      .cancelExpiredEntrySession(session.id, 'TIMEOUT_CLEANUP')
+      .cancelExpiredEntrySession(session.id, 'TIMEOUT_CLEANUP', 0)
       .then((res) => ({ action: res ? 'TIMEOUT_CANCELLED' : 'TIMEOUT_SKIPPED' }))
       .catch((err) => ({ action: 'TIMEOUT_ERROR', error: err }));
 

@@ -8,6 +8,7 @@ import {
 } from '@prisma/client';
 import { AppError } from '../../common/errors/app-error';
 import { ErrorCodes } from '../../common/errors/error-codes';
+import { env } from '../../config/env';
 import { normalizeLicensePlate, normalizeRfidUid } from '../../common/utils/normalizers';
 import { buildPaginatedResult, PaginatedResult } from '../../common/utils/pagination';
 import { prisma } from '../../integrations/database/prisma.client';
@@ -283,10 +284,12 @@ export class ParkingSessionService {
   /**
    * Tác vụ nội bộ quét hủy phiên chờ vào quá hạn (cancelExpiredEntrySession)
    * Đồng bộ nguyên tử với confirmEntryPassage bằng khóa dòng FOR UPDATE.
+   * Kiểm tra điều kiện thời gian chờ thực tế vượt quá cấu hình (mặc định 60 giây) (F01).
    */
   public async cancelExpiredEntrySession(
     sessionId: string,
-    reason = 'ENTRY_TIMEOUT_EXPIRED'
+    reason = 'ENTRY_TIMEOUT_EXPIRED',
+    timeoutSeconds = env.DEFAULT_ENTRY_TIMEOUT_SECONDS
   ): Promise<ParkingSession | null> {
     return prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM parking_sessions WHERE id = ${sessionId} FOR UPDATE`;
@@ -306,11 +309,20 @@ export class ParkingSessionService {
         return null;
       }
 
+      // F01: Xác minh thời gian chờ vào cổng đã thực sự quá hạn
+      const now = new Date();
+      const timeoutMs = timeoutSeconds * 1000;
+      const isExpired = (now.getTime() - session.entryTime.getTime()) >= timeoutMs;
+
+      if (!isExpired) {
+        return null; // Chưa quá hạn, bảo lưu phiên PENDING_ENTRY
+      }
+
       return tx.parkingSession.update({
         where: { id: sessionId },
         data: {
           status: ParkingSessionStatus.CANCELLED,
-          cancelledAt: new Date(),
+          cancelledAt: now,
           cancelReason: reason
         }
       });
@@ -357,6 +369,12 @@ export class ParkingSessionService {
    * Vào bãi thủ công qua giao diện CMS (manualEntry)
    * Tạo trực tiếp phiên ACTIVE kèm đầy đủ vết kiểm toán. Tuyệt đối không điều khiển Servo.
    */
+  /**
+   * Vào bãi thủ công qua giao diện CMS (manualEntry)
+   * Tạo trực tiếp phiên ACTIVE kèm đầy đủ vết kiểm toán. Tuyệt đối không điều khiển Servo.
+   * F02 & F03: Toàn bộ quá trình tạo xe, thẻ và tiếp nhận thực thi trong một transaction nguyên tử;
+   * không tạo thẻ RFID giả lập nếu không quét thẻ vật lý.
+   */
   public async manualEntry(
     operatorId: string,
     input: ManualEntryInput
@@ -373,67 +391,62 @@ export class ParkingSessionService {
       );
     }
 
-    // 1. Tìm hoặc tạo phương tiện
-    let vehicle = await prisma.vehicle.findUnique({
-      where: { licensePlate: normalizedPlate }
-    });
-
-    if (!vehicle) {
-      vehicle = await prisma.vehicle.create({
-        data: {
-          licensePlate: normalizedPlate,
-          vehicleType: input.vehicleType,
-          isActive: true
-        }
-      });
-    }
-
-    // 2. Tìm hoặc gán thẻ RFID
-    let rfidCardId: string;
-    if (input.rfidCardUid) {
-      const normalizedUid = normalizeRfidUid(input.rfidCardUid);
-      let card = await prisma.rFIDCard.findUnique({ where: { uid: normalizedUid } });
-      if (!card) {
-        // Tự động tạo thẻ vãng lai mới nếu chưa có trong kho (bảo vệ xung đột đồng thời)
-        try {
-          card = await prisma.rFIDCard.create({
-            data: { uid: normalizedUid, status: RfidCardStatus.ACTIVE }
-          });
-        } catch (err: any) {
-          if (err.code === 'P2002') {
-            card = await prisma.rFIDCard.findUnique({ where: { uid: normalizedUid } });
-          } else {
-            throw err;
-          }
-        }
-      }
-      if (!card || card.status !== RfidCardStatus.ACTIVE) {
-        throw AppError.badRequest(
-          `Thẻ RFID "${normalizedUid}" đang bị khóa (${card?.status}), không thể sử dụng`,
-          ErrorCodes.RFID_CARD_BLOCKED
-        );
-      }
-      rfidCardId = card.id;
-    } else {
-      // Khi vào thủ công không quét thẻ, tự động cấp thẻ vãng lai placeholder định danh duy nhất
-      const placeholderCard = await prisma.rFIDCard.create({
-        data: {
-          uid: `MAN_${Date.now().toString(36).toUpperCase()}_${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
-          status: RfidCardStatus.ACTIVE
-        }
-      });
-      rfidCardId = placeholderCard.id;
-    }
-
-    // 3. Thực thi giao dịch tiếp nhận đơn nhất có khóa hàng bi quan
+    // F03: Thực thi toàn bộ quá trình tìm/tạo phương tiện, thẻ RFID và tiếp nhận trong cùng một giao dịch
     return prisma.$transaction(async (tx) => {
+      // 1. Kiểm soát sức chứa bảo thủ có khóa hàng bi quan (FOR UPDATE)
       await AdmissionService.executeConservativeAdmission(tx, input.parkingLotId);
 
-      // Kiểm tra xe và thẻ không có phiên đang chạy
+      // 2. Tìm hoặc tạo phương tiện trong cùng giao dịch
+      let vehicle = await tx.vehicle.findUnique({
+        where: { licensePlate: normalizedPlate }
+      });
+
+      if (!vehicle) {
+        vehicle = await tx.vehicle.create({
+          data: {
+            licensePlate: normalizedPlate,
+            vehicleType: input.vehicleType,
+            isActive: true
+          }
+        });
+      }
+
+      // 3. Tìm hoặc gán thẻ RFID (F02: Nếu không truyền mã thẻ thì giữ null, không tạo thẻ giả lập)
+      let rfidCardId: string | null = null;
+      if (input.rfidCardUid) {
+        const normalizedUid = normalizeRfidUid(input.rfidCardUid);
+        let card = await tx.rFIDCard.findUnique({ where: { uid: normalizedUid } });
+        if (!card) {
+          // Tự động tạo thẻ vãng lai mới nếu chưa có trong kho (bảo vệ xung đột đồng thời)
+          try {
+            card = await tx.rFIDCard.create({
+              data: { uid: normalizedUid, status: RfidCardStatus.ACTIVE }
+            });
+          } catch (err: any) {
+            if (err.code === 'P2002') {
+              card = await tx.rFIDCard.findUnique({ where: { uid: normalizedUid } });
+            } else {
+              throw err;
+            }
+          }
+        }
+        if (!card || card.status !== RfidCardStatus.ACTIVE) {
+          throw AppError.badRequest(
+            `Thẻ RFID "${normalizedUid}" đang bị khóa (${card?.status}), không thể sử dụng`,
+            ErrorCodes.RFID_CARD_BLOCKED
+          );
+        }
+        rfidCardId = card.id;
+      }
+
+      // 4. Kiểm tra xe và thẻ không có phiên đang chạy
       const activeSession = await tx.parkingSession.findFirst({
         where: {
-          OR: [{ vehicleId: vehicle.id }, { rfidCardId }],
-          status: { in: [ParkingSessionStatus.PENDING_ENTRY, ParkingSessionStatus.ACTIVE, ParkingSessionStatus.PENDING_EXIT] }
+          status: { in: [ParkingSessionStatus.PENDING_ENTRY, ParkingSessionStatus.ACTIVE, ParkingSessionStatus.PENDING_EXIT] },
+          OR: [
+            { vehicleId: vehicle.id },
+            ...(rfidCardId ? [{ rfidCardId }] : [])
+          ]
         }
       });
 
@@ -444,7 +457,7 @@ export class ParkingSessionService {
         );
       }
 
-      // Snapshot biểu giá
+      // 5. Snapshot biểu giá
       const snapshot = await BillingCalculator.resolvePricingSnapshot(
         input.parkingLotId,
         input.vehicleType,

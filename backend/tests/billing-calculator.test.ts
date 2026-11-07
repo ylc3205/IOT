@@ -126,6 +126,43 @@ describe('BillingCalculator Unit & Integration Tests', () => {
     expect(result.totalFee.toString()).toBe('30000');
   });
 
+  it('BIL-05b: Quy chuẩn kiểm thử lũy tiến theo giờ: 70 phút, 80 phút (tính 2 giờ), 125 phút (tính 3 giờ)', () => {
+    const entryTime = new Date('2026-11-06T08:00:00.000Z');
+
+    // 70 phút -> 2 giờ (30,000 VND)
+    const res70 = BillingCalculator.calculateParkingFee({
+      entryTime,
+      cutoffTime: new Date(entryTime.getTime() + 70 * 60 * 1000),
+      pricingType: PricingType.PER_HOUR,
+      rate: '15000.00'
+    });
+    expect(res70.durationMinutes).toBe(70);
+    expect(res70.billableHours).toBe(2);
+    expect(res70.totalFee.toString()).toBe('30000');
+
+    // 80 phút -> 2 giờ (30,000 VND)
+    const res80 = BillingCalculator.calculateParkingFee({
+      entryTime,
+      cutoffTime: new Date(entryTime.getTime() + 80 * 60 * 1000),
+      pricingType: PricingType.PER_HOUR,
+      rate: '15000.00'
+    });
+    expect(res80.durationMinutes).toBe(80);
+    expect(res80.billableHours).toBe(2);
+    expect(res80.totalFee.toString()).toBe('30000');
+
+    // 125 phút -> 3 giờ (45,000 VND)
+    const res125 = BillingCalculator.calculateParkingFee({
+      entryTime,
+      cutoffTime: new Date(entryTime.getTime() + 125 * 60 * 1000),
+      pricingType: PricingType.PER_HOUR,
+      rate: '15000.00'
+    });
+    expect(res125.durationMinutes).toBe(125);
+    expect(res125.billableHours).toBe(3);
+    expect(res125.totalFee.toString()).toBe('45000');
+  });
+
   it('BIL-06: Tính phí theo giờ (PER_HOUR): Đỗ 24 giờ 1 phút tính 25 giờ', () => {
     const entryTime = new Date('2026-11-06T08:00:00.000Z');
     const cutoffTime = new Date('2026-11-07T08:01:00.000Z'); // 1441 phút
